@@ -6,8 +6,8 @@ import os
 import pandas as pd
 
 # ✅ Add backend folder to Python path
-backend_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Backend'))
-sys.path.append(backend_path)
+root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(root_path)
 
 # ✅ Import backend modules
 from backend.graph_simulation import IoTNetwork
