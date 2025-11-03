@@ -1,213 +1,335 @@
 import streamlit as st
 import networkx as nx
 import plotly.graph_objects as go
-import sys
-import os
+import plotly.express as px
+import sys, os
 import pandas as pd
 
-# ✅ Add backend folder to Python path
+# ✅ Add backend path
 root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.append(root_path)
+if root_path not in sys.path:
+    sys.path.append(root_path)
 
-# ✅ Import backend modules
+# ✅ Import backend logic
 from backend.graph_simulation import IoTNetwork
 from backend.routing_algorithms import RoutingEngine
-from backend.energy_model import basic_energy_model
+from backend.energy_model import advanced_energy_model
 
-# ✅ Function to compare routing paths
+
+# --------------------------------------------------------
+# ✅ Packet Size Graph
+# --------------------------------------------------------
+def packet_size_energy_curve(distance):
+    sizes = [1, 5, 10]
+    labels = ["Small", "Medium", "Large"]
+    energy_values = [advanced_energy_model(distance, s) for s in sizes]
+
+    df = pd.DataFrame({"Packet Size": labels, "Energy Cost": energy_values})
+
+    fig = px.line(
+        df,
+        x="Packet Size",
+        y="Energy Cost",
+        markers=True,
+        title=f"Energy Cost vs Packet Size (Distance = {distance})"
+    )
+    fig.update_layout(height=300)
+    return fig
+
+
+# --------------------------------------------------------
+# ✅ Battery History Helpers
+# --------------------------------------------------------
+def _init_battery_history():
+    if 'battery_history' not in st.session_state:
+        st.session_state['battery_history'] = {}
+    if 'hist_steps' not in st.session_state:
+        st.session_state['hist_steps'] = 0
+    if 'last_path_nodes' not in st.session_state:
+        st.session_state['last_path_nodes'] = []
+
+
+def update_battery_history(graph, path):
+    _init_battery_history()
+    st.session_state['last_path_nodes'] = list(path)
+
+    for node in path:
+        curr_energy = graph.nodes[node].get('energy', 0)
+        if node not in st.session_state['battery_history']:
+            st.session_state['battery_history'][node] = [None] * st.session_state['hist_steps']
+        st.session_state['battery_history'][node].append(curr_energy)
+
+    for node, history in st.session_state['battery_history'].items():
+        if node not in path:
+            history.append(None)
+
+    st.session_state['hist_steps'] += 1
+
+
+def plot_battery_history_for_last_path():
+    _init_battery_history()
+    last_nodes = st.session_state['last_path_nodes']
+
+    if not last_nodes:
+        st.info("Run a route to display battery history.")
+        return
+
+    steps = st.session_state['hist_steps']
+    history = st.session_state['battery_history']
+
+    df = pd.DataFrame(index=list(range(steps)))
+
+    for node in last_nodes:
+        hist = history.get(node, [])
+        if len(hist) < steps:
+            hist += [None] * (steps - len(hist))
+        df[f"Node {node}"] = hist
+
+    df = df.dropna(how='all')
+    if df.empty:
+        st.info("No battery values recorded yet.")
+        return
+
+    df_long = df.reset_index().melt(id_vars='index', var_name='Node', value_name='Battery')
+
+    fig = px.line(
+        df_long,
+        x='index',
+        y='Battery',
+        color='Node',
+        markers=True,
+        title="Battery Usage History (Last Routed Path)"
+    )
+    fig.update_layout(height=350)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# --------------------------------------------------------
+# ✅ Routing Comparison Table
+# --------------------------------------------------------
 def compare_routes(graph, dist_path, energy_path):
-    dist_total = RoutingEngine.distance_cost(graph, dist_path)
-    energy_total = RoutingEngine.energy_cost(graph, energy_path)
+    dist_energy = RoutingEngine.energy_cost(graph, dist_path)
+    e_energy = RoutingEngine.energy_cost(graph, energy_path)
 
-    dist_hops = len(dist_path) - 1
-    energy_hops = len(energy_path) - 1
+    saved = dist_energy - e_energy
+    saved_percent = (saved / dist_energy * 100) if dist_energy > 0 else 0
 
-    energy_saved = dist_total - energy_total
-    energy_saved_percent = (energy_saved / dist_total) * 100 if dist_total != 0 else 0
-
-    data = {
-        "Metric": ["Total Distance", "Total Energy Cost", "Hop Count", "Energy Saved (%)"],
-        "Shortest Path": [
-            str(dist_total),
-            "-",
-            str(dist_hops),
-            "-"
+    df = pd.DataFrame({
+        "Metric": [
+            "Shortest Path Distance",
+            "Energy (Shortest Path)",
+            "Energy (Energy Efficient)",
+            "Energy Saved (%)"
         ],
-        "Energy-Efficient Path": [
-            "-",
-            str(energy_total),
-            str(energy_hops),
-            f"{energy_saved_percent:.2f}%"
+        "Value": [
+            f"{RoutingEngine.distance_cost(graph, dist_path):.2f}",
+            f"{dist_energy:.2f}",
+            f"{e_energy:.2f}",
+            f"{saved_percent:.2f}%"
         ]
-    }
-
-    df = pd.DataFrame(data)
+    })
     return df
 
 
-# ✅ FUNCTION TO DRAW GRAPH WITH ENERGY LABELS
+# --------------------------------------------------------
+# ✅ Draw IoT Network Graph
+# --------------------------------------------------------
 def draw_network(graph, path=None):
     pos = nx.spring_layout(graph, seed=42)
 
-    edge_x = []
-    edge_y = []
-    edge_labels_x = []
-    edge_labels_y = []
-    energy_text = []
+    edge_x, edge_y = [], []
+    label_x, label_y, label_text = [], [], []
 
     for u, v, data in graph.edges(data=True):
         x0, y0 = pos[u]
         x1, y1 = pos[v]
+
         edge_x.extend([x0, x1, None])
         edge_y.extend([y0, y1, None])
 
-        # ✅ Label position (middle of edge)
-        edge_labels_x.append((x0 + x1) / 2)
-        edge_labels_y.append((y0 + y1) / 2)
-        energy_text.append(f"{data['energy_cost']}")
+        label_x.append((x0 + x1) / 2)
+        label_y.append((y0 + y1) / 2)
+        label_text.append(f"{data['energy_cost']:.2f}")
 
-    # ✅ Edges
-    edge_trace = go.Scatter(
-        x=edge_x, y=edge_y,
-        line=dict(width=1),
-        hoverinfo='none',
-        mode='lines'
-    )
+    edge_trace = go.Scatter(x=edge_x, y=edge_y, mode="lines", line=dict(width=1))
+    label_trace = go.Scatter(x=label_x, y=label_y, mode="text", text=label_text)
 
-    # ✅ Edge energy labels
-    label_trace = go.Scatter(
-        x=edge_labels_x,
-        y=edge_labels_y,
-        mode='text',
-        text=energy_text,
-        textposition="top center",
-        hoverinfo="none"
-    )
+    node_x, node_y, node_colors, hover = [], [], [], []
 
-    # ✅ Nodes
-    node_x = []
-    node_y = []
-    text_info = []
     for node in graph.nodes():
         x, y = pos[node]
         node_x.append(x)
         node_y.append(y)
-        text_info.append(f"Node: {node}")
+
+        e = graph.nodes[node]["energy"]
+        hover.append(f"Node {node} | Energy: {e}")
+
+        if e > 60:
+            node_colors.append("green")
+        elif e > 30:
+            node_colors.append("yellow")
+        elif e > 0:
+            node_colors.append("red")
+        else:
+            node_colors.append("black")
 
     node_trace = go.Scatter(
         x=node_x, y=node_y,
-        mode='markers+text',
-        text=[str(n) for n in graph.nodes()],
+        mode="markers+text",
+        text=list(graph.nodes()),
         textposition="top center",
-        marker=dict(size=18),
-        hovertext=text_info
+        marker=dict(size=18, color=node_colors),
+        hovertext=hover
     )
 
-    # ✅ Highlight path
+    traces = [edge_trace, node_trace, label_trace]
+
     if path:
-        px = []
-        py = []
+        px, py = [], []
         for u, v in zip(path, path[1:]):
             x0, y0 = pos[u]
             x1, y1 = pos[v]
             px.extend([x0, x1, None])
             py.extend([y0, y1, None])
 
-        path_trace = go.Scatter(
-            x=px, y=py,
-            mode='lines',
-            line=dict(width=4),
-            hoverinfo='none'
-        )
-        return [edge_trace, path_trace, node_trace, label_trace]
+        path_trace = go.Scatter(x=px, y=py, mode="lines", line=dict(width=4))
+        traces.insert(1, path_trace)
 
-    return [edge_trace, node_trace, label_trace]
+    return traces
 
 
-# ✅ STREAMLIT PAGE SETTINGS
-st.set_page_config(
-    page_title="IoT Energy Efficient Routing",
-    layout="wide",
-    initial_sidebar_state="expanded",
-    menu_items={}  # ✅ REMOVE 3 DOT MENU + DEPLOY BUTTON
-)
-
+# --------------------------------------------------------
+# ✅ STREAMLIT MAIN UI
+# --------------------------------------------------------
+st.set_page_config(page_title="IoT Routing", layout="wide")
 st.title("🌐 Energy-Efficient Data Routing in IoT Networks")
 
+st.sidebar.header("⚙️ Configuration")
+num_nodes = st.sidebar.slider("Total IoT Devices", 5, 25, 10)
+pkt_label = st.sidebar.radio("Packet Size", ("Small", "Medium", "Large"))
+pkt_map = {"Small": 1, "Medium": 5, "Large": 10}
+packet_size = pkt_map[pkt_label]
 
-# ✅ Sidebar Settings
-st.sidebar.header("⚙️ Simulation Settings")
-num_nodes = st.sidebar.slider("Number of IoT Devices", 5, 25, 10)
 
+# ✅ Generate Network
 if st.sidebar.button("Generate Network"):
-    st.session_state['network'] = IoTNetwork(num_nodes=num_nodes)
-    st.session_state['network'].assign_energy_costs(basic_energy_model)
-    st.success("✅ New IoT Network Generated!")
+    st.session_state['network'] = IoTNetwork(num_nodes)
+    st.session_state['network'].assign_energy_costs(advanced_energy_model, packet_size)
+
+    _init_battery_history()
+
+    # record initial energy snapshot
+    for node in st.session_state['network'].graph.nodes():
+        st.session_state['battery_history'][node] = [
+            st.session_state['network'].graph.nodes[node]['energy']
+        ]
+
+    st.session_state['hist_steps'] = 1
+    st.success("✅ Network Successfully Generated!")
 
 
-# ✅ MAIN UI
+# --------------------------------------------------------
+# ✅ MAIN SCREEN AFTER NETWORK CREATION
+# --------------------------------------------------------
 if 'network' in st.session_state:
+
     graph = st.session_state['network'].graph
 
-    st.subheader("📡 Network Visualization")
-
-    path = None  # default
+    st.subheader("📡 IoT Network Graph")
 
     col1, col2 = st.columns(2)
-    with col1:
-        source = st.selectbox("Select Source Node", list(graph.nodes()))
-    with col2:
-        target = st.selectbox("Select Target Node", list(graph.nodes()))
+    source = col1.selectbox("Source", list(graph.nodes()))
+    target = col2.selectbox("Target", list(graph.nodes()))
+
+    path_draw = None
+
+    left, right = st.columns(2)
 
     # ✅ Shortest Distance Routing
-    if st.button("Run Shortest Distance Routing"):
-        try:
-            path = RoutingEngine.shortest_path_distance(graph, source, target)
-            st.info(f"📌 Shortest Path: {path}")
-            st.write(f"✅ Total Distance = {RoutingEngine.distance_cost(graph, path)}")
-        except nx.NetworkXNoPath:
-            st.error("❌ No path exists")
+    with left:
+        if st.button("Run Shortest Distance Routing"):
+            try:
+                path = RoutingEngine.shortest_path_distance(graph, source, target)
+                RoutingEngine.apply_battery_drain(graph, path, packet_size)
+                st.session_state['network'].assign_energy_costs(advanced_energy_model, packet_size)
+                update_battery_history(graph, path)
+
+                path_draw = path
+                st.info(f"📌 Path: {path}")
+            except:
+                st.error("❌ No path found")
 
     # ✅ Energy Efficient Routing
-    if st.button("Run Energy Efficient Routing"):
-        try:
-            path = RoutingEngine.shortest_path_energy(graph, source, target)
-            st.success(f"✅ Energy Efficient Path: {path}")
-            st.write(f"⚡ Total Energy Cost = {RoutingEngine.energy_cost(graph, path)}")
-        except nx.NetworkXNoPath:
-            st.error("❌ No path exists")
+    with left:
+        if st.button("Run Energy Efficient Routing"):
+            try:
+                path = RoutingEngine.shortest_path_energy(graph, source, target)
+                RoutingEngine.apply_battery_drain(graph, path, packet_size)
+                st.session_state['network'].assign_energy_costs(advanced_energy_model, packet_size)
+                update_battery_history(graph, path)
 
-    # ✅ Comparison Table
-    if st.button("Compare Routes"):
-        try:
-            dist_path = RoutingEngine.shortest_path_distance(graph, source, target)
-            energy_path = RoutingEngine.shortest_path_energy(graph, source, target)
+                path_draw = path
+                st.success(f"✅ Energy Path: {path}")
+            except:
+                st.error("❌ No path found")
 
-            df = compare_routes(graph, dist_path, energy_path)
-            st.subheader("📊 Routing Comparison")
-            st.table(df)
+    # ✅ Compare Routes
+    with right:
+        if st.button("Compare Paths"):
+            try:
+                dpath = RoutingEngine.shortest_path_distance(graph, source, target)
+                epath = RoutingEngine.shortest_path_energy(graph, source, target)
+                st.table(compare_routes(graph, dpath, epath))
+            except:
+                st.error("Unable to compare")
 
-        except nx.NetworkXNoPath:
-            st.error("❌ No path exists")
+    # ✅ Random Node Failure
+    with right:
+        if st.button("Simulate Node Failure"):
+            fail = st.session_state['network'].fail_random_node()
+            st.session_state['network'].assign_energy_costs(advanced_energy_model, packet_size)
+            st.error(f"💀 Node {fail} Failed!" if fail is not None else "No alive node left")
 
-    # ✅ Draw graph
-    traces = draw_network(graph, path)
+    # ✅ Draw Final Network Graph (with removed zoom/pan + no traces)
+    traces = draw_network(graph, path_draw)
     fig = go.Figure(data=traces)
-
-    # ✅ Limit toolbar to only download + fullscreen
     fig.update_layout(
-        showlegend=False,
         height=600,
-        modebar={
-            "remove": [
-                "zoom", "pan", "select", "lasso2d",
-                "zoomIn2d", "zoomOut2d", "autoScale2d",
-                "hoverClosestCartesian", "hoverCompareCartesian"
-            ]
-        }
+        showlegend=False,
+        modebar_remove=[
+            "zoom", "pan", "zoomIn2d", "zoomOut2d",
+            "autoScale2d", "resetScale2d",
+            "select2d", "lasso2d"
+        ]
     )
-
     st.plotly_chart(fig, use_container_width=True)
 
+    # ✅ Battery History Graph
+    st.subheader("📉 Battery History (Nodes in Last Path)")
+    plot_battery_history_for_last_path()
+
+    # ✅ Packet Size Graph (always last)
+    st.subheader("📈 Packet Size vs Energy Cost")
+    demo_dist = st.slider("Pick Distance", 1, 20, 10)
+    fig2 = packet_size_energy_curve(demo_dist)
+    fig2.update_layout(
+        showlegend=False,
+        modebar_remove=[
+            "zoom", "pan", "zoomIn2d", "zoomOut2d",
+            "autoScale2d", "resetScale2d",
+            "select2d", "lasso2d"
+        ]
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+
+
+    # ✅ Sidebar Summary
+    alive = sum(1 for _, d in graph.nodes(data=True) if d['energy'] > 0)
+    dead = len(graph.nodes) - alive
+
+    st.sidebar.markdown("### 📊 Network Status")
+    st.sidebar.write(f"🟢 Alive Nodes: {alive}")
+    st.sidebar.write(f"⚫ Dead Nodes: {dead}")
+
 else:
-    st.warning("⚠️ Click 'Generate Network' to start.")
+    st.warning("⚠️ Please generate a network to start.")
